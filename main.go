@@ -1,102 +1,115 @@
 package main
 
 import (
-	"encoding/csv"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
 const (
-	serverURL                 = "http://srv.msk01.gigacorp.local/_stats"
-	loadAverageThreshold      = 30.0
-	memoryUsageThreshold      = 0.8
-	diskUsageThreshold        = 0.9
-	networkBandwidthThreshold = 0.9
-	checkInterval             = 10 * time.Second
-	errorThreshold            = 3
+	RequestTimout     = 2 * time.Second
+	RequestsFrequency = 300 * time.Millisecond
+	ErrorThreshold    = 3
+	ServerURL         = "http://srv.msk01.gigacorp.local/_stats"
+	LoadThreshold     = 30
+	MemoryThreshold   = 80
+	DiskThreshold     = 90
+	NetworkThreshold  = 90
 )
 
-var errorCount int
-
-func fetchServerStats() ([]string, error) {
-	resp, err := http.Get(serverURL)
-	if err != nil {
-		errorCount++
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		errorCount++
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	reader := csv.NewReader(resp.Body)
-	data, err := reader.Read()
-	if err != nil {
-		errorCount++
-		return nil, err
-	}
-
-	if len(data) != 6 {
-		errorCount++
-		return nil, fmt.Errorf("unexpected data length: %d", len(data))
-	}
-
-	return data, nil
-}
-
-func checkServerStats(stats []string) {
-	loadAverage, _ := strconv.ParseFloat(stats[0], 64)
-	totalMemory, _ := strconv.Atoi(stats[1])
-	usedMemory, _ := strconv.Atoi(stats[2])
-	totalDiskSpace, _ := strconv.Atoi(stats[3])
-	usedDiskSpace, _ := strconv.Atoi(stats[4])
-	networkBandwidth, _ := strconv.Atoi(stats[5])
-
-	// Проверка Load Average
-	if loadAverage > loadAverageThreshold {
-		fmt.Printf("Load Average is too high: %.2fn", loadAverage)
-	}
-
-	// Проверка использования памяти
-	memoryUsagePercentage := float64(usedMemory) / float64(totalMemory) * 100
-	if memoryUsagePercentage > memoryUsageThreshold*100 {
-		fmt.Printf("Memory usage too high: %.2f%%n", memoryUsagePercentage)
-	}
-
-	// Проверка использования дискового пространства
-	freeDiskSpaceMB := float64(totalDiskSpace-usedDiskSpace) / (1024 * 1024)
-	if freeDiskSpaceMB < (float64(totalDiskSpace)*(1-diskUsageThreshold))/(1024*1024) {
-		fmt.Printf("Free disk space is too low: %.2f Mb leftn", freeDiskSpaceMB)
-	}
-
-	// Проверка сетевой загрузки
-	networkUsagePercentage := float64(usedMemory) / float64(networkBandwidth) * 100
-	freeNetworkBandwidthMbit := float64(networkBandwidth-usedMemory) / (1024 * 1024) * 8
-	if networkUsagePercentage > networkBandwidthThreshold*100 {
-		fmt.Printf("Network bandwidth usage high: %.2f Mbit/s availablen", freeNetworkBandwidthMbit)
-	}
+type ServerStats struct {
+	LoadAverage     int
+	MemoryCapacity  int
+	MemoryUsage     int
+	DiskCapacity    int
+	DiskUsage       int
+	NetworkCapacity int
+	NetworkUsage    int
 }
 
 func main() {
-	for {
-		stats, err := fetchServerStats()
-		if err != nil {
-			if errorCount >= errorThreshold {
-				fmt.Println("Unable to fetch server statistics.")
-			}
-			time.Sleep(checkInterval)
-			continue
+	poll := CreateServerPoller(ServerURL, RequestTimout, RequestsFrequency, ErrorThreshold)
+	analyze := CreateStatsAnalyzer(LoadThreshold, MemoryThreshold, DiskThreshold, NetworkThreshold)
+
+	for response := range poll() {
+		stats := ParseStats(response)
+		analyze(stats)
+	}
+}
+
+func CreateStatsAnalyzer(loadThreshold, memoryThreshold, diskThreshold, networkThreshold int) func(serverStats ServerStats) {
+	return func(stats ServerStats) {
+		memoryUsagePercent := int(float64(stats.MemoryUsage) / float64(stats.MemoryCapacity) * 100)
+		diskUsagePercent := int(float64(stats.DiskUsage) / float64(stats.DiskCapacity) * 100)
+		networkUsagePercent := int(float64(stats.NetworkUsage) / float64(stats.NetworkCapacity) * 100)
+
+		if stats.LoadAverage > loadThreshold {
+			fmt.Printf("Load Average is too high: %d\n", stats.LoadAverage)
 		}
+		if memoryUsagePercent > memoryThreshold {
+			fmt.Printf("Memory usage too high: %d%%\n", memoryUsagePercent)
+		}
+		if diskUsagePercent > diskThreshold {
+			availableSpace := (stats.DiskCapacity - stats.DiskUsage) / 1024 / 1024
+			fmt.Printf("Free disk space is too low: %d Mb left\n", availableSpace)
+		}
+		if networkUsagePercent > networkThreshold {
+			availableBandwidth := (stats.NetworkCapacity - stats.NetworkUsage) / 1000 / 1000
+			fmt.Printf("Network bandwidth usage high: %d Mbit/s available\n", availableBandwidth)
+		}
+	}
+}
 
-		checkServerStats(stats)
+func ParseStats(rawStats []byte) ServerStats {
+	stats := [7]int{}
+	for index, value := range strings.Split(strings.Trim(string(rawStats), "\n"), ",") {
+		number, err := strconv.Atoi(value)
+		if err != nil {
+			panic(err)
+		}
+		stats[index] = number
+	}
+	return ServerStats{stats[0], stats[1], stats[2], stats[3], stats[4], stats[5], stats[6]}
+}
 
-		// Сброс счетчика ошибок при успешном запросе
-		errorCount = 0
+func CreateServerPoller(url string, reqTimeout time.Duration, reqFreq time.Duration, errorThreshold int) func() chan []byte {
+	return func() chan []byte {
+		responsesChan := make(chan []byte, 3)
+		client := http.Client{Timeout: reqTimeout}
+		errorCounter := 0
 
-		time.Sleep(checkInterval)
+		go func() {
+			defer close(responsesChan)
+			for {
+				time.Sleep(reqFreq)
+				if errorCounter >= errorThreshold {
+					fmt.Printf("Unable to fetch server statistic")
+					break
+				}
+
+				response, err := client.Get(url)
+				if err != nil {
+					errorCounter++
+					fmt.Printf("failed to send request %s\n", err)
+					continue
+				}
+				if response.StatusCode != http.StatusOK {
+					errorCounter++
+					continue
+				}
+				body, err := io.ReadAll(response.Body)
+				if err != nil {
+					errorCounter++
+					fmt.Printf("failed to parse response %s\n", err)
+					continue
+				}
+				_ = response.Body.Close()
+				responsesChan <- body
+			}
+		}()
+		return responsesChan
 	}
 }
